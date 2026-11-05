@@ -1,0 +1,218 @@
+#include <WiFi.h>
+#include <Wire.h>
+
+#define OLED_ADDR 0x3C
+
+// Credenciais do seu Wi-Fi
+const char* ssid     = "Hollow";
+const char* password = "0160code";
+
+// Definição das configurações para IP Fixo (Estático)
+IPAddress ipLocal(10, 223, 224, 141);     // O IP que ficará gravado para sempre
+IPAddress gateway(10, 223, 224, 1);       // Gateway padrão da sua rede
+IPAddress subnet(255, 255, 255, 0);       // Máscara de sub-rede comum
+IPAddress dns(10, 223, 224, 1);           // Servidor DNS (geralmente o roteador)
+
+WiFiServer server(80);
+
+int estadoOlho = 0; 
+
+// Variáveis para controle do tempo da piscada automática (sem travar o código)
+unsigned long tempoAnteriorPisca = 0;
+unsigned long intervaloProximaPiscada = 4000; // Tempo inicial: 4 segundos
+bool estaPiscandoPropositalmente = false;
+unsigned long tempoInicioPiscada = 0;
+
+void enviarComando(TwoWire &portaI2C, uint8_t c) {
+  portaI2C.beginTransmission(OLED_ADDR);
+  portaI2C.write(0x00); 
+  portaI2C.write(c);
+  portaI2C.endTransmission();
+}
+
+void inicializarOLED(TwoWire &portaI2C) {
+  enviarComando(portaI2C, 0xAE); 
+  enviarComando(portaI2C, 0xD5); enviarComando(portaI2C, 0x80);
+  enviarComando(portaI2C, 0xA8); enviarComando(portaI2C, 0x3F); 
+  enviarComando(portaI2C, 0xD3); enviarComando(portaI2C, 0x00);
+  enviarComando(portaI2C, 0x40); 
+  enviarComando(portaI2C, 0x8D); enviarComando(portaI2C, 0x14); 
+  enviarComando(portaI2C, 0x20); enviarComando(portaI2C, 0x00); 
+  enviarComando(portaI2C, 0xA1); 
+  enviarComando(portaI2C, 0xC8); 
+  enviarComando(portaI2C, 0xDA); enviarComando(portaI2C, 0x12);
+  enviarComando(portaI2C, 0x81); enviarComando(portaI2C, 0xCF);
+  enviarComando(portaI2C, 0xD9); enviarComando(portaI2C, 0xF1);
+  enviarComando(portaI2C, 0xDB); enviarComando(portaI2C, 0x40);
+  enviarComando(portaI2C, 0xA4); 
+  enviarComando(portaI2C, 0xA6); 
+  enviarComando(portaI2C, 0xAF); 
+}
+
+void desenharOlho(TwoWire &portaI2C, int estado) {
+  enviarComando(portaI2C, 0x21); enviarComando(portaI2C, 0); enviarComando(portaI2C, 127); 
+  enviarComando(portaI2C, 0x22); enviarComando(portaI2C, 0); enviarComando(portaI2C, 7);   
+
+  for (uint8_t pagina = 0; pagina < 8; pagina++) {
+    portaI2C.beginTransmission(OLED_ADDR);
+    portaI2C.write(0x40); 
+    
+    for (uint8_t coluna = 0; coluna < 128; coluna++) {
+      uint8_t pixelByte = 0x00; 
+
+      if (pagina >= 2 && pagina <= 5) {
+        if (coluna >= 44 && coluna <= 84) {
+          if (estado == 3) { 
+            if (pagina == 3) pixelByte = 0x01;
+          } 
+          else {
+            if ((pagina == 2 && (coluna == 44 || coluna == 84)) || (pagina == 5 && (coluna == 44 || coluna == 84))) {
+              pixelByte = 0x00;
+            } else {
+              pixelByte = 0xFF; 
+              
+              int offsetPupila = 0;
+              if (estado == 1) offsetPupila = -10; 
+              if (estado == 2) offsetPupila = 10;  
+
+              if (coluna >= (58 + offsetPupila) && coluna <= (70 + offsetPupila)) {
+                if (pagina == 3 || pagina == 4) {
+                  pixelByte = 0x00; 
+                }
+              }
+            }
+          }
+        }
+      }
+      
+      portaI2C.write(pixelByte);
+      
+      if (coluna % 16 == 0) {
+        portaI2C.endTransmission();
+        portaI2C.beginTransmission(OLED_ADDR);
+        portaI2C.write(0x40);
+      }
+    }
+    portaI2C.endTransmission();
+  }
+}
+
+void atualizarOlhos(int estado) {
+  desenharOlho(Wire, estado);  
+  desenharOlho(Wire1, estado); 
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Inicializa Displays
+  Wire.begin(21, 22);
+  inicializarOLED(Wire);
+  Wire1.begin(19, 18);
+  inicializarOLED(Wire1);
+  
+  atualizarOlhos(0);
+
+  // Força o ESP32 a fixar a configuração de rede antes de iniciar o Wi-Fi
+  if (!WiFi.config(ipLocal, gateway, subnet, dns)) {
+    Serial.println("Falha ao configurar IP Estático");
+  }
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWi-Fi Conectado.");
+  Serial.print("IP FIXO DO FRANKTRON: ");
+  Serial.println(WiFi.localIP());
+  
+  server.begin();
+}
+
+void loop() {
+  unsigned long tempoAtual = millis();
+
+  // MÁGICA DA PISCADA AUTOMÁTICA (Mecanismo não-bloqueante)
+  if (!estaPiscandoPropositalmente && estadoOlho != 3) {
+    if (tempoAtual - tempoAnteriorPisca >= intervaloProximaPiscada) {
+      atualizarOlhos(3); // Fecha os olhos (pisca)
+      estaPiscandoPropositalmente = true;
+      tempoInicioPiscada = tempoAtual;
+    }
+  }
+
+  // Após 150 milissegundos piscando, reabre os olhos para o estado em que estava antes
+  if (estaPiscandoPropositalmente) {
+    if (tempoAtual - tempoInicioPiscada >= 150) {
+      atualizarOlhos(estadoOlho); // Reabre os olhos
+      estaPiscandoPropositalmente = false;
+      tempoAnteriorPisca = tempoAtual;
+      intervaloProximaPiscada = random(3000, 7000); // Sorteia o tempo para a próxima piscada (entre 3 e 7 segundos)
+    }
+  }
+
+  WiFiClient client = server.available();
+
+  if (client) {
+    String currentLine = "";
+    while (client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        if (c == '\n') {
+          if (currentLine.length() == 0) {
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html; charset=utf-8");
+            client.println("Connection: close");
+            client.println();
+            
+            client.println("<!DOCTYPE html><html>");
+            client.println("<head><meta name='viewport' content='width=device-width, initial-scale=1.0'>");
+            client.println("<title>Expressões do Beemo</title>");
+            client.println("<style>");
+            client.println("body { font-family: Arial, sans-serif; text-align: center; background-color: #eef7ff; margin-top: 40px; }");
+            client.println(".box { background: white; max-width: 360px; margin: 0 auto; padding: 25px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }");
+            client.println("h1 { color: #2a9d8f; margin-bottom: 25px; }");
+            client.println(".btn { display: block; width: 85%; margin: 12px auto; padding: 14px; font-size: 16px; color: white; border: none; border-radius: 30px; text-decoration: none; font-weight: bold; cursor: pointer; }");
+            client.println(".b-centro { background-color: #2a9d8f; }");
+            client.println(".b-lado { background-color: #f4a261; }");
+            client.println(".b-pisca { background-color: #e76f51; }");
+            client.println("</style></head><body>");
+            
+            client.println("<div class='box'>");
+            client.println("<h1>Olho do Beemo 🤖</h1>");
+            client.println("<p>Controle para onde o Beemo está olhando:</p>");
+            
+            client.println("<a href='/centro' class='btn b-centro'>👀 Olhar para Frente</a>");
+            client.println("<a href='/esquerda' class='btn b-lado'>⬅️ Olhar Esquerda</a>");
+            client.println("<a href='/direita' class='btn b-lado'>➡️ Olhar Direita</a>");
+            client.println("<a href='/piscar' class='btn b-pisca'>😑 Manter Fechado</a>");
+            
+            client.println("</div></body></html>");
+            break;
+          } else { currentLine = ""; }
+        } else if (c != '\r') { currentLine += c; }
+
+        if (currentLine.endsWith("GET /centro")) {
+          estadoOlho = 0;
+          atualizarOlhos(estadoOlho);
+        }
+        if (currentLine.endsWith("GET /esquerda")) {
+          estadoOlho = 1;
+          atualizarOlhos(estadoOlho);
+        }
+        if (currentLine.endsWith("GET /direita")) {
+          estadoOlho = 2;
+          atualizarOlhos(estadoOlho);
+        }
+        if (currentLine.endsWith("GET /piscar")) {
+          estadoOlho = 3; // Mantém fechado até dar outro comando
+          atualizarOlhos(estadoOlho);
+        }
+      }
+    }
+    client.stop();
+  }
+}
